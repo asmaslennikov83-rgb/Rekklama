@@ -47,6 +47,14 @@ STATUS_NAMES = {
     11: "На паузе",
 }
 
+# Для мониторинга считаем актуальными только кампании, которыми ещё можно управлять:
+# готовые к запуску, активные и на паузе.
+CURRENT_CAMPAIGN_STATUSES = {4, 9, 11}
+
+
+def is_current_campaign_status(status: int | None) -> bool:
+    return status in CURRENT_CAMPAIGN_STATUSES
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -425,12 +433,19 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
 
         details = await client.campaign_details(session, ids) if ids else []
         parsed = {}
+        current_ids: set[int] = set()
+
         for item in details:
             try:
                 advert_id, name, status = parse_campaign(item)
+                if not is_current_campaign_status(status):
+                    continue
                 parsed[advert_id] = (name, status)
+                current_ids.add(advert_id)
             except Exception as exc:
                 logger.warning("Bad campaign row: %s | %s", item, exc)
+
+        ids = sorted(current_ids)
 
         existing_rows = await db_fetchall(
             "SELECT * FROM campaigns WHERE cabinet_id = ?",
@@ -467,7 +482,8 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                     await notify(
                         bot,
                         "🆕 <b>Новая рекламная кампания</b>\n"
-                        f"Кампания: <b>{name}</b>\n"
+                        f"ID кампании: <code>{advert_id}</code>\n"
+                        f"Название: <b>{name}</b>\n"
                         f"Кабинет: <b>{cabinet_name}</b>\n"
                         f"Статус: {STATUS_NAMES.get(status, status)}\n"
                         f"Баланс: <b>{budget_text}</b>",
@@ -491,7 +507,8 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                         await notify(
                             bot,
                             f"{title}\n"
-                            f"Кампания: <b>{name}</b>\n"
+                            f"ID кампании: <code>{advert_id}</code>\n"
+                        f"Название: <b>{name}</b>\n"
                             f"Кабинет: <b>{cabinet_name}</b>\n"
                             f"Баланс: <b>{budget_text}</b>",
                         )
@@ -519,7 +536,8 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                     await notify(
                         bot,
                         "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ</b>\n"
-                        f"Кампания: <b>{name}</b>\n"
+                        f"ID кампании: <code>{advert_id}</code>\n"
+                        f"Название: <b>{name}</b>\n"
                         f"Кабинет: <b>{cabinet_name}</b>\n"
                         f"Баланс: <b>{budget:.0f} ₽</b>",
                     )
@@ -532,7 +550,8 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                         await notify(
                             bot,
                             "🟡 <b>Баланс рекламы ниже 300 ₽</b>\n"
-                            f"Кампания: <b>{name}</b>\n"
+                            f"ID кампании: <code>{advert_id}</code>\n"
+                        f"Название: <b>{name}</b>\n"
                             f"Кабинет: <b>{cabinet_name}</b>\n"
                             f"Баланс: <b>{budget:.0f} ₽</b>",
                         )
@@ -559,7 +578,12 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                 f"Кабинет: <b>{cabinet_name}</b>",
             )
 
-        return total_count, active_count
+        current_total = len(ids)
+        current_active = sum(
+            1 for advert_id in ids
+            if parsed.get(advert_id, ("", None))[1] == 9
+        )
+        return current_total, current_active
 
 
 async def check_all(
@@ -691,10 +715,24 @@ async def send_status(target: Message | CallbackQuery, bot: Bot):
                 client = WBClient(decrypt_token(cabinet["token_enc"]))
                 async with aiohttp.ClientSession() as session:
                     data = await client.campaign_count(session)
-                total, active = count_active(data)
+                    all_ids = sorted(extract_ids(data))
+                    details = await client.campaign_details(session, all_ids) if all_ids else []
+
+                current_total = 0
+                active = 0
+                for item in details:
+                    try:
+                        _, _, status = parse_campaign(item)
+                    except Exception:
+                        continue
+                    if is_current_campaign_status(status):
+                        current_total += 1
+                        if status == 9:
+                            active += 1
+
                 lines.append(
                     f"\n🏢 <b>{cabinet['seller_name']}</b>\n"
-                    f"Всего кампаний: <b>{total}</b>\n"
+                    f"Актуальных кампаний: <b>{current_total}</b>\n"
                     f"Запущено: <b>{active}</b>"
                 )
             except Exception as exc:
@@ -756,7 +794,7 @@ async def cb_check_now(callback: CallbackQuery, bot: Bot):
                     lines.append(f"\n🏢 <b>{name}</b>\n⚠️ {error[:200]}")
                 else:
                     lines.append(
-                        f"\n🏢 <b>{name}</b>\nВсего: <b>{total}</b> | Запущено: <b>{active}</b>"
+                        f"\n🏢 <b>{name}</b>\nАктуальных: <b>{total}</b> | Запущено: <b>{active}</b>"
                     )
             text = "\n".join(lines)
         await callback.message.edit_text(text, reply_markup=back_keyboard())
