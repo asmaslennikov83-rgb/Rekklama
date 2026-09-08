@@ -362,6 +362,24 @@ def extract_ids(count_data: dict) -> set[int]:
     return ids
 
 
+def extract_current_ids(count_data: dict) -> set[int]:
+    ids: set[int] = set()
+    for group in count_data.get("adverts", []) or []:
+        try:
+            group_status = int(group.get("status"))
+        except (TypeError, ValueError):
+            continue
+
+        if group_status not in CURRENT_CAMPAIGN_STATUSES:
+            continue
+
+        for item in group.get("advert_list", []) or []:
+            advert_id = item.get("advertId") or item.get("advert_id") or item.get("id")
+            if advert_id is not None:
+                ids.add(int(advert_id))
+    return ids
+
+
 def count_active(count_data: dict) -> tuple[int, int]:
     total = int(count_data.get("all", 0) or 0)
     active = 0
@@ -372,12 +390,19 @@ def count_active(count_data: dict) -> tuple[int, int]:
 
 
 def parse_campaign(item: dict) -> tuple[int, str, int | None]:
-    advert_id = item.get("advertId") or item.get("advert_id") or item.get("id")
-    name = item.get("name") or item.get("advertName") or item.get("title") or f"Кампания {advert_id}"
-    status = item.get("status")
+    advert_id = item.get("advertId")
     if advert_id is None:
-        raise ValueError("WB API: в данных кампании отсутствует ID")
-    return int(advert_id), str(name), int(status) if status is not None else None
+        advert_id = item.get("advert_id") or item.get("id")
+    if advert_id is None:
+        raise ValueError("WB API: в данных кампании отсутствует advertId")
+
+    raw_name = item.get("name")
+    name = str(raw_name).strip() if raw_name is not None else ""
+    if not name:
+        name = f"Без названия (ID {advert_id})"
+
+    status = item.get("status")
+    return int(advert_id), name, int(status) if status is not None else None
 
 
 async def save_event(text: str) -> None:
@@ -428,24 +453,47 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
 
     async with aiohttp.ClientSession() as session:
         count_data = await client.campaign_count(session)
-        ids = sorted(extract_ids(count_data))
+        ids = sorted(extract_current_ids(count_data))
         total_count, active_count = count_active(count_data)
 
         details = await client.campaign_details(session, ids) if ids else []
+
+        status_by_id: dict[int, int] = {}
+        for group in count_data.get("adverts", []) or []:
+            try:
+                group_status = int(group.get("status"))
+            except (TypeError, ValueError):
+                continue
+            if group_status not in CURRENT_CAMPAIGN_STATUSES:
+                continue
+            for row in group.get("advert_list", []) or []:
+                advert_id = row.get("advertId") or row.get("advert_id") or row.get("id")
+                if advert_id is not None:
+                    status_by_id[int(advert_id)] = group_status
+
         parsed = {}
-        current_ids: set[int] = set()
+        requested_ids = set(ids)
 
         for item in details:
             try:
-                advert_id, name, status = parse_campaign(item)
-                if not is_current_campaign_status(status):
+                advert_id, name, detail_status = parse_campaign(item)
+                if advert_id not in requested_ids:
                     continue
-                parsed[advert_id] = (name, status)
-                current_ids.add(advert_id)
+                parsed[advert_id] = (name, status_by_id.get(advert_id, detail_status))
             except Exception as exc:
                 logger.warning("Bad campaign row: %s | %s", item, exc)
 
-        ids = sorted(current_ids)
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            await db_execute(
+                f"DELETE FROM campaigns WHERE cabinet_id=? AND advert_id NOT IN ({placeholders})",
+                (cabinet_id, *ids),
+            )
+        else:
+            await db_execute(
+                "DELETE FROM campaigns WHERE cabinet_id=?",
+                (cabinet_id,),
+            )
 
         existing_rows = await db_fetchall(
             "SELECT * FROM campaigns WHERE cabinet_id = ?",
@@ -715,20 +763,17 @@ async def send_status(target: Message | CallbackQuery, bot: Bot):
                 client = WBClient(decrypt_token(cabinet["token_enc"]))
                 async with aiohttp.ClientSession() as session:
                     data = await client.campaign_count(session)
-                    all_ids = sorted(extract_ids(data))
-                    details = await client.campaign_details(session, all_ids) if all_ids else []
 
-                current_total = 0
+                current_ids = extract_current_ids(data)
+                current_total = len(current_ids)
                 active = 0
-                for item in details:
+                for group in data.get("adverts", []) or []:
                     try:
-                        _, _, status = parse_campaign(item)
-                    except Exception:
+                        group_status = int(group.get("status"))
+                    except (TypeError, ValueError):
                         continue
-                    if is_current_campaign_status(status):
-                        current_total += 1
-                        if status == 9:
-                            active += 1
+                    if group_status == 9:
+                        active += len(group.get("advert_list", []) or [])
 
                 lines.append(
                     f"\n🏢 <b>{cabinet['seller_name']}</b>\n"
