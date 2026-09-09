@@ -33,6 +33,7 @@ APP_SECRET = os.getenv("APP_SECRET", "").strip()
 DB_PATH = os.getenv("DB_PATH", "wb_ads_bot.db")
 DEFAULT_CHECK_INTERVAL = int(os.getenv("DEFAULT_CHECK_INTERVAL", "15"))
 ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
+EXCLUDED_CAMPAIGN_IDS_RAW = os.getenv("EXCLUDED_CAMPAIGN_IDS", "23200814").strip()
 MAX_CABINETS = 2
 
 WB_ADVERT_BASE = "https://advert-api.wildberries.ru"
@@ -197,6 +198,28 @@ async def is_owner(user_id: int) -> bool:
     return user_id in await get_allowed_user_ids()
 
 
+def get_excluded_campaign_ids() -> set[int]:
+    result: set[int] = set()
+    for raw in EXCLUDED_CAMPAIGN_IDS_RAW.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            result.add(int(raw))
+        except ValueError:
+            logger.warning("Некорректный ID в EXCLUDED_CAMPAIGN_IDS: %s", raw)
+    return result
+
+
+def is_excluded_campaign_id(advert_id: int | None) -> bool:
+    if advert_id is None:
+        return False
+    try:
+        return int(advert_id) in get_excluded_campaign_ids()
+    except (TypeError, ValueError):
+        return False
+
+
 def menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -335,10 +358,15 @@ class WBClient:
         else:
             rows = []
 
-        return [item for item in rows if not is_archived_campaign(item)]
+        return [
+            item for item in rows
+            if not is_archived_campaign(item)
+            and not is_excluded_campaign_id(item.get("id"))
+        ]
 
     async def campaigns_by_ids(self, session: aiohttp.ClientSession, ids: list[int]) -> list[dict]:
         result: list[dict] = []
+        ids = [advert_id for advert_id in ids if not is_excluded_campaign_id(advert_id)]
         for pos in range(0, len(ids), 50):
             chunk = ids[pos:pos + 50]
             data = await self._get(
@@ -475,6 +503,8 @@ async def fetch_budget_safe(
     session: aiohttp.ClientSession,
     advert_id: int,
 ) -> float | None:
+    if is_excluded_campaign_id(advert_id):
+        return None
     try:
         value = await client.budget(session, advert_id)
         await asyncio.sleep(0.75)  # дополнительный запас по лимитам WB API
@@ -490,11 +520,26 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
     token = decrypt_token(cabinet["token_enc"])
     client = WBClient(token)
 
+    excluded_ids = sorted(get_excluded_campaign_ids())
+    if excluded_ids:
+        placeholders = ",".join("?" for _ in excluded_ids)
+        await db_execute(
+            f"DELETE FROM campaigns WHERE cabinet_id=? AND advert_id IN ({placeholders})",
+            (cabinet_id, *excluded_ids),
+        )
+
     async with aiohttp.ClientSession() as session:
         details = await client.current_campaigns(session)
         parsed: dict[int, tuple[str, int | None]] = {}
         for item in details:
             try:
+                if is_excluded_campaign_id(item.get("id")):
+                    logger.info(
+                        "Кампания исключена вручную из мониторинга: id=%s",
+                        item.get("id"),
+                    )
+                    continue
+
                 if is_archived_campaign(item):
                     logger.info(
                         "Архивная кампания исключена: id=%s status=%s deleted=%s",
