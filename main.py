@@ -321,7 +321,20 @@ class WBClient:
         data = await self._get(session, f"{WB_ADVERT_BASE}/adv/v1/promotion/count")
         return data or {}
 
-    async def campaign_details(self, session: aiohttp.ClientSession, ids: list[int]) -> list[dict]:
+    async def current_campaigns(self, session: aiohttp.ClientSession) -> list[dict]:
+        data = await self._get(
+            session,
+            f"{WB_ADVERT_BASE}/api/advert/v2/adverts",
+            params={"statuses": "4,9,11"},
+        )
+        if isinstance(data, dict):
+            adverts = data.get("adverts")
+            return adverts if isinstance(adverts, list) else []
+        if isinstance(data, list):
+            return data
+        return []
+
+    async def campaigns_by_ids(self, session: aiohttp.ClientSession, ids: list[int]) -> list[dict]:
         result: list[dict] = []
         for pos in range(0, len(ids), 50):
             chunk = ids[pos:pos + 50]
@@ -330,14 +343,11 @@ class WBClient:
                 f"{WB_ADVERT_BASE}/api/advert/v2/adverts",
                 params={"ids": ",".join(map(str, chunk))},
             )
-            if isinstance(data, list):
+            if isinstance(data, dict):
+                adverts = data.get("adverts")
+                if isinstance(adverts, list): result.extend(adverts)
+            elif isinstance(data, list):
                 result.extend(data)
-            elif isinstance(data, dict):
-                # На случай изменения оболочки ответа WB.
-                for key in ("adverts", "data", "items"):
-                    if isinstance(data.get(key), list):
-                        result.extend(data[key])
-                        break
             await asyncio.sleep(0.8)
         return result
 
@@ -390,13 +400,13 @@ def count_active(count_data: dict) -> tuple[int, int]:
 
 
 def parse_campaign(item: dict) -> tuple[int, str, int | None]:
-    advert_id = item.get("advertId")
+    """Разбор ответа GET /api/advert/v2/adverts."""
+    advert_id = item.get("id")
     if advert_id is None:
-        advert_id = item.get("advert_id") or item.get("id")
-    if advert_id is None:
-        raise ValueError("WB API: в данных кампании отсутствует advertId")
+        raise ValueError("WB API V2: в данных кампании отсутствует поле id")
 
-    raw_name = item.get("name")
+    settings = item.get("settings") or {}
+    raw_name = settings.get("name")
     name = str(raw_name).strip() if raw_name is not None else ""
     if not name:
         name = f"Без названия (ID {advert_id})"
@@ -452,186 +462,85 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
     client = WBClient(token)
 
     async with aiohttp.ClientSession() as session:
-        count_data = await client.campaign_count(session)
-        ids = sorted(extract_current_ids(count_data))
-        total_count, active_count = count_active(count_data)
-
-        details = await client.campaign_details(session, ids) if ids else []
-
-        status_by_id: dict[int, int] = {}
-        for group in count_data.get("adverts", []) or []:
-            try:
-                group_status = int(group.get("status"))
-            except (TypeError, ValueError):
-                continue
-            if group_status not in CURRENT_CAMPAIGN_STATUSES:
-                continue
-            for row in group.get("advert_list", []) or []:
-                advert_id = row.get("advertId") or row.get("advert_id") or row.get("id")
-                if advert_id is not None:
-                    status_by_id[int(advert_id)] = group_status
-
-        parsed = {}
-        requested_ids = set(ids)
-
+        details = await client.current_campaigns(session)
+        parsed: dict[int, tuple[str, int | None]] = {}
         for item in details:
             try:
-                advert_id, name, detail_status = parse_campaign(item)
-                if advert_id not in requested_ids:
+                advert_id, name, status = parse_campaign(item)
+                if status not in CURRENT_CAMPAIGN_STATUSES:
                     continue
-                parsed[advert_id] = (name, status_by_id.get(advert_id, detail_status))
+                parsed[advert_id] = (name, status)
             except Exception as exc:
-                logger.warning("Bad campaign row: %s | %s", item, exc)
+                logger.warning("Bad V2 campaign row: %s | %s", item, exc)
 
-        if ids:
-            placeholders = ",".join("?" for _ in ids)
-            await db_execute(
-                f"DELETE FROM campaigns WHERE cabinet_id=? AND advert_id NOT IN ({placeholders})",
-                (cabinet_id, *ids),
-            )
-        else:
-            await db_execute(
-                "DELETE FROM campaigns WHERE cabinet_id=?",
-                (cabinet_id,),
-            )
-
-        existing_rows = await db_fetchall(
-            "SELECT * FROM campaigns WHERE cabinet_id = ?",
-            (cabinet_id,),
-        )
+        current_ids = set(parsed)
+        existing_rows = await db_fetchall("SELECT * FROM campaigns WHERE cabinet_id = ?", (cabinet_id,))
         existing = {int(row["advert_id"]): row for row in existing_rows}
         first_sync = not bool(cabinet["initialized"])
 
-        for advert_id in ids:
-            name, status = parsed.get(advert_id, (f"Кампания {advert_id}", None))
+        missing_ids = sorted(set(existing) - current_ids)
+        missing_details = {}
+        if missing_ids:
+            try:
+                rows = await client.campaigns_by_ids(session, missing_ids)
+                for item in rows:
+                    try:
+                        aid, nm, st = parse_campaign(item)
+                        missing_details[aid] = (nm, st)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.warning("Не удалось уточнить статусы исчезнувших кампаний: %s", exc)
+
+        for advert_id in missing_ids:
+            old = existing[advert_id]
+            old_name = old["name"] or f"Кампания {advert_id}"
+            name, new_status = missing_details.get(advert_id, (old_name, None))
+            if new_status in (7, 8, -1):
+                title = "⛔ <b>Кампания завершена</b>" if new_status == 7 else ("❌ <b>Кампания отменена</b>" if new_status == 8 else "🗑 <b>Кампания удалена</b>")
+                await notify(bot, f"{title}\nID кампании: <code>{advert_id}</code>\nНазвание: <b>{name}</b>\nКабинет: <b>{cabinet_name}</b>")
+            await db_execute("DELETE FROM campaigns WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
+
+        for advert_id, (name, status) in parsed.items():
             old = existing.get(advert_id)
             is_new = old is None
-
-            need_budget = (
-                status == 9
-                or is_new
-                or (old is not None and old["status"] != status and status in (7, 8, 11))
-            )
-            budget = await fetch_budget_safe(client, session, advert_id) if need_budget else (
-                float(old["last_budget"]) if old and old["last_budget"] is not None else None
-            )
+            need_budget = status == 9 or is_new or (old is not None and old["status"] != status and status == 11)
+            budget = await fetch_budget_safe(client, session, advert_id) if need_budget else (float(old["last_budget"]) if old and old["last_budget"] is not None else None)
 
             if is_new:
-                await db_execute(
-                    """
-                    INSERT INTO campaigns(
-                        cabinet_id, advert_id, name, status, last_budget, warning_300_sent
-                    ) VALUES (?, ?, ?, ?, ?, 0)
-                    """,
-                    (cabinet_id, advert_id, name, status, budget),
-                )
+                await db_execute("""INSERT INTO campaigns(cabinet_id, advert_id, name, status, last_budget, warning_300_sent) VALUES (?, ?, ?, ?, ?, 0)""", (cabinet_id, advert_id, name, status, budget))
                 if not first_sync:
                     budget_text = f"{budget:.0f} ₽" if budget is not None else "не удалось получить"
-                    await notify(
-                        bot,
-                        "🆕 <b>Новая рекламная кампания</b>\n"
-                        f"ID кампании: <code>{advert_id}</code>\n"
-                        f"Название: <b>{name}</b>\n"
-                        f"Кабинет: <b>{cabinet_name}</b>\n"
-                        f"Статус: {STATUS_NAMES.get(status, status)}\n"
-                        f"Баланс: <b>{budget_text}</b>",
-                    )
+                    await notify(bot, "🆕 <b>Новая рекламная кампания</b>\n" f"ID кампании: <code>{advert_id}</code>\n" f"Название: <b>{name}</b>\n" f"Кабинет: <b>{cabinet_name}</b>\n" f"Статус: {STATUS_NAMES.get(status, status)}\n" f"Баланс: <b>{budget_text}</b>")
             else:
                 old_status = old["status"]
                 if old_status != status and status is not None:
                     budget_text = f"{budget:.0f} ₽" if budget is not None else "не удалось получить"
-                    if status == 11:
-                        title = "⏸ <b>Кампания остановлена / на паузе</b>"
-                    elif status == 7:
-                        title = "⛔ <b>Кампания завершена</b>"
-                    elif status == 8:
-                        title = "❌ <b>Кампания отменена</b>"
-                    elif status == 9 and old_status != 9:
-                        title = "✅ <b>Кампания возобновлена</b>"
-                    else:
-                        title = None
-
+                    title = "⏸ <b>Кампания остановлена / на паузе</b>" if status == 11 else ("✅ <b>Кампания возобновлена</b>" if status == 9 and old_status != 9 else ("🟡 <b>Кампания готова к запуску</b>" if status == 4 else None))
                     if title:
-                        await notify(
-                            bot,
-                            f"{title}\n"
-                            f"ID кампании: <code>{advert_id}</code>\n"
-                        f"Название: <b>{name}</b>\n"
-                            f"Кабинет: <b>{cabinet_name}</b>\n"
-                            f"Баланс: <b>{budget_text}</b>",
-                        )
+                        await notify(bot, f"{title}\nID кампании: <code>{advert_id}</code>\nНазвание: <b>{name}</b>\nКабинет: <b>{cabinet_name}</b>\nБаланс: <b>{budget_text}</b>")
+                await db_execute("""UPDATE campaigns SET name=?, status=?, last_budget=COALESCE(?, last_budget), updated_at=CURRENT_TIMESTAMP WHERE cabinet_id=? AND advert_id=?""", (name, status, budget, cabinet_id, advert_id))
 
-                await db_execute(
-                    """
-                    UPDATE campaigns
-                    SET name=?, status=?, last_budget=COALESCE(?, last_budget),
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE cabinet_id=? AND advert_id=?
-                    """,
-                    (name, status, budget, cabinet_id, advert_id),
-                )
-
-            # Балансовые уведомления — только для активных кампаний.
             if status == 9 and budget is not None:
-                row = await db_fetchone(
-                    "SELECT warning_300_sent FROM campaigns WHERE cabinet_id=? AND advert_id=?",
-                    (cabinet_id, advert_id),
-                )
+                row = await db_fetchone("SELECT warning_300_sent FROM campaigns WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
                 warned_300 = bool(row["warning_300_sent"]) if row else False
-
                 if budget <= 100:
-                    # По ТЗ повторяем при КАЖДОЙ проверке.
-                    await notify(
-                        bot,
-                        "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ</b>\n"
-                        f"ID кампании: <code>{advert_id}</code>\n"
-                        f"Название: <b>{name}</b>\n"
-                        f"Кабинет: <b>{cabinet_name}</b>\n"
-                        f"Баланс: <b>{budget:.0f} ₽</b>",
-                    )
-                    await db_execute(
-                        "UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?",
-                        (cabinet_id, advert_id),
-                    )
+                    await notify(bot, "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ</b>\n" f"ID кампании: <code>{advert_id}</code>\n" f"Название: <b>{name}</b>\n" f"Кабинет: <b>{cabinet_name}</b>\n" f"Баланс: <b>{budget:.0f} ₽</b>")
+                    await db_execute("UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
                 elif budget <= 300:
                     if not warned_300:
-                        await notify(
-                            bot,
-                            "🟡 <b>Баланс рекламы ниже 300 ₽</b>\n"
-                            f"ID кампании: <code>{advert_id}</code>\n"
-                        f"Название: <b>{name}</b>\n"
-                            f"Кабинет: <b>{cabinet_name}</b>\n"
-                            f"Баланс: <b>{budget:.0f} ₽</b>",
-                        )
-                        await db_execute(
-                            "UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?",
-                            (cabinet_id, advert_id),
-                        )
-                else:
-                    # После пополнения выше 300 ₽ порог снова становится активным.
-                    if warned_300:
-                        await db_execute(
-                            "UPDATE campaigns SET warning_300_sent=0 WHERE cabinet_id=? AND advert_id=?",
-                            (cabinet_id, advert_id),
-                        )
+                        await notify(bot, "🟡 <b>Баланс рекламы ниже 300 ₽</b>\n" f"ID кампании: <code>{advert_id}</code>\n" f"Название: <b>{name}</b>\n" f"Кабинет: <b>{cabinet_name}</b>\n" f"Баланс: <b>{budget:.0f} ₽</b>")
+                        await db_execute("UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
+                elif warned_300:
+                    await db_execute("UPDATE campaigns SET warning_300_sent=0 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
 
         if first_sync:
             await db_execute("UPDATE cabinets SET initialized=1 WHERE id=?", (cabinet_id,))
-
         if cabinet["api_error_active"]:
             await db_execute("UPDATE cabinets SET api_error_active=0 WHERE id=?", (cabinet_id,))
-            await notify(
-                bot,
-                "✅ <b>Связь с WB API восстановлена</b>\n"
-                f"Кабинет: <b>{cabinet_name}</b>",
-            )
+            await notify(bot, "✅ <b>Связь с WB API восстановлена</b>\n" f"Кабинет: <b>{cabinet_name}</b>")
 
-        current_total = len(ids)
-        current_active = sum(
-            1 for advert_id in ids
-            if parsed.get(advert_id, ("", None))[1] == 9
-        )
-        return current_total, current_active
+        return len(parsed), sum(1 for _, st in parsed.values() if st == 9)
 
 
 async def check_all(
@@ -762,19 +671,18 @@ async def send_status(target: Message | CallbackQuery, bot: Bot):
             try:
                 client = WBClient(decrypt_token(cabinet["token_enc"]))
                 async with aiohttp.ClientSession() as session:
-                    data = await client.campaign_count(session)
-
-                current_ids = extract_current_ids(data)
-                current_total = len(current_ids)
+                    campaigns = await client.current_campaigns(session)
+                current_total = 0
                 active = 0
-                for group in data.get("adverts", []) or []:
+                for item in campaigns:
                     try:
-                        group_status = int(group.get("status"))
-                    except (TypeError, ValueError):
+                        _, _, status = parse_campaign(item)
+                    except Exception:
                         continue
-                    if group_status == 9:
-                        active += len(group.get("advert_list", []) or [])
-
+                    if status in CURRENT_CAMPAIGN_STATUSES:
+                        current_total += 1
+                        if status == 9:
+                            active += 1
                 lines.append(
                     f"\n🏢 <b>{cabinet['seller_name']}</b>\n"
                     f"Актуальных кампаний: <b>{current_total}</b>\n"
@@ -908,7 +816,7 @@ async def receive_cabinet_token(message: Message, state: FSMContext):
         async with aiohttp.ClientSession() as session:
             # Проверяем только Promotion API. seller-info намеренно не вызываем,
             # чтобы не зависеть от 429 на common-api.
-            await client.campaign_count(session)
+            await client.current_campaigns(session)
 
         # Для уникальности кабинета используем стабильный хэш токена.
         # Сам токен в открытом виде в БД не сохраняется.
