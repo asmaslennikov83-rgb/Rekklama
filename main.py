@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import uuid
 import os
 from datetime import datetime
 from typing import Any
@@ -65,6 +66,10 @@ logger = logging.getLogger("wb_ads_bot")
 router = Router()
 poll_wakeup = asyncio.Event()
 check_lock = asyncio.Lock()
+topup_locks: dict[tuple[int, int], asyncio.Lock] = {}
+pending_topups: dict[str, dict] = {}
+recent_topups: dict[tuple[int, int, int], float] = {}
+TOPUP_DUPLICATE_GUARD_SECONDS = 60
 
 
 class AddCabinet(StatesGroup):
@@ -218,6 +223,37 @@ def is_excluded_campaign_id(advert_id: int | None) -> bool:
         return int(advert_id) in get_excluded_campaign_ids()
     except (TypeError, ValueError):
         return False
+
+
+def topup_keyboard(cabinet_id: int, advert_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="➕ 1 000 ₽",
+                callback_data=f"topup_ask:{cabinet_id}:{advert_id}:1000",
+            ),
+            InlineKeyboardButton(
+                text="➕ 5 000 ₽",
+                callback_data=f"topup_ask:{cabinet_id}:{advert_id}:5000",
+            ),
+        ]]
+    )
+
+
+def topup_confirm_keyboard(token: str, amount: int) -> InlineKeyboardMarkup:
+    amount_text = f"{amount:,}".replace(",", " ")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"✅ Пополнить {amount_text} ₽",
+                callback_data=f"topup_confirm:{token}",
+            )],
+            [InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"topup_cancel:{token}",
+            )],
+        ]
+    )
 
 
 def menu_keyboard() -> InlineKeyboardMarkup:
@@ -382,6 +418,86 @@ class WBClient:
             await asyncio.sleep(0.8)
         return result
 
+    async def _post(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        *,
+        params: dict | None = None,
+        json_body: dict | None = None,
+        max_retries: int = 3,
+    ) -> Any:
+        timeout = aiohttp.ClientTimeout(total=45)
+        backoff_seconds = [30, 60, 120]
+
+        for attempt in range(max_retries + 1):
+            async with session.post(
+                url,
+                headers=self.headers,
+                params=params,
+                json=json_body,
+                timeout=timeout,
+            ) as resp:
+                body = await resp.text()
+
+                if resp.status == 401:
+                    raise RuntimeError("WB API: токен не авторизован (401)")
+
+                if resp.status == 429:
+                    if attempt >= max_retries:
+                        raise RuntimeError(
+                            f"WB API: превышен лимит запросов (429) после {max_retries + 1} попыток"
+                        )
+                    retry_after_raw = resp.headers.get("Retry-After")
+                    wait_seconds = None
+                    if retry_after_raw:
+                        try:
+                            wait_seconds = float(retry_after_raw)
+                        except ValueError:
+                            wait_seconds = None
+                    if wait_seconds is None or wait_seconds <= 0:
+                        wait_seconds = backoff_seconds[min(attempt, len(backoff_seconds)-1)]
+                    wait_seconds = min(max(wait_seconds + 0.5, 1.0), 180.0)
+                    await asyncio.sleep(wait_seconds)
+                    continue
+
+                if resp.status >= 500:
+                    if attempt < max_retries:
+                        await asyncio.sleep(backoff_seconds[min(attempt, len(backoff_seconds)-1)])
+                        continue
+                    raise RuntimeError(f"WB API: HTTP {resp.status}: {body[:400]}")
+
+                if resp.status >= 400:
+                    raise RuntimeError(f"WB API: HTTP {resp.status}: {body[:400]}")
+
+                if resp.status == 204 or not body:
+                    return {}
+
+                try:
+                    return await resp.json()
+                except Exception:
+                    return {}
+
+        raise RuntimeError("WB API: не удалось выполнить POST-запрос")
+
+    async def budget_deposit(
+        self,
+        session: aiohttp.ClientSession,
+        advert_id: int,
+        amount: int,
+    ) -> dict:
+        data = await self._post(
+            session,
+            f"{WB_ADVERT_BASE}/adv/v1/budget/deposit",
+            params={"id": advert_id},
+            json_body={
+                "sum": int(amount),
+                "type": 1,
+                "return": True,
+            },
+        )
+        return data if isinstance(data, dict) else {}
+
     async def budget(self, session: aiohttp.ClientSession, advert_id: int) -> float:
         data = await self._get(
             session,
@@ -484,14 +600,18 @@ async def save_event(text: str) -> None:
     await set_setting("events", __import__("json").dumps(events, ensure_ascii=False))
 
 
-async def notify(bot: Bot, text: str) -> None:
+async def notify(
+    bot: Bot,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     user_ids = await get_allowed_user_ids()
     if not user_ids:
         return
 
     for user_id in sorted(user_ids):
         try:
-            await bot.send_message(user_id, text)
+            await bot.send_message(user_id, text, reply_markup=reply_markup)
         except Exception as exc:
             logger.warning("Не удалось отправить уведомление пользователю %s: %s", user_id, exc)
 
@@ -944,6 +1064,189 @@ async def receive_cabinet_token(message: Message, state: FSMContext):
             "Проверьте API-токен категории «Продвижение» и попробуйте ещё раз.",
             reply_markup=back_keyboard(),
         )
+
+
+
+@router.callback_query(F.data.startswith("topup_ask:"))
+async def cb_topup_ask(callback: CallbackQuery):
+    if not await guard_callback(callback):
+        return
+
+    try:
+        _, cabinet_id_raw, advert_id_raw, amount_raw = callback.data.split(":")
+        cabinet_id = int(cabinet_id_raw)
+        advert_id = int(advert_id_raw)
+        amount = int(amount_raw)
+    except Exception:
+        await callback.answer("Некорректные параметры пополнения.", show_alert=True)
+        return
+
+    if amount not in (1000, 5000):
+        await callback.answer("Недопустимая сумма.", show_alert=True)
+        return
+
+    if is_excluded_campaign_id(advert_id):
+        await callback.answer("Эта кампания исключена из мониторинга.", show_alert=True)
+        return
+
+    cabinet = await db_fetchone("SELECT * FROM cabinets WHERE id=?", (cabinet_id,))
+    campaign = await db_fetchone(
+        "SELECT * FROM campaigns WHERE cabinet_id=? AND advert_id=?",
+        (cabinet_id, advert_id),
+    )
+
+    if not cabinet or not campaign:
+        await callback.answer("Кампания или кабинет не найдены.", show_alert=True)
+        return
+
+    token = uuid.uuid4().hex[:12]
+    pending_topups[token] = {
+        "cabinet_id": cabinet_id,
+        "advert_id": advert_id,
+        "amount": amount,
+        "user_id": callback.from_user.id,
+    }
+
+    amount_text = f"{amount:,}".replace(",", " ")
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "💳 <b>Подтверждение пополнения</b>\n\n"
+            f"ID кампании: <code>{advert_id}</code>\n"
+            f"Название: <b>{campaign['name']}</b>\n"
+            f"Кабинет: <b>{cabinet['seller_name']}</b>\n"
+            f"Сумма: <b>{amount_text} ₽</b>\n"
+            "Источник: <b>Баланс рекламного кабинета</b>\n\n"
+            "Подтвердите операцию:",
+            reply_markup=topup_confirm_keyboard(token, amount),
+        )
+
+
+@router.callback_query(F.data.startswith("topup_cancel:"))
+async def cb_topup_cancel(callback: CallbackQuery):
+    if not await guard_callback(callback):
+        return
+    token = callback.data.split(":", 1)[1]
+    pending = pending_topups.get(token)
+    if pending and pending.get("user_id") == callback.from_user.id:
+        pending_topups.pop(token, None)
+    await callback.answer("Отменено")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("topup_confirm:"))
+async def cb_topup_confirm(callback: CallbackQuery):
+    if not await guard_callback(callback):
+        return
+
+    token = callback.data.split(":", 1)[1]
+    pending = pending_topups.get(token)
+    if not pending:
+        await callback.answer("Операция уже выполнена или устарела.", show_alert=True)
+        return
+
+    if pending.get("user_id") != callback.from_user.id:
+        await callback.answer(
+            "Подтвердить может пользователь, который открыл пополнение.",
+            show_alert=True,
+        )
+        return
+
+    cabinet_id = int(pending["cabinet_id"])
+    advert_id = int(pending["advert_id"])
+    amount = int(pending["amount"])
+
+    key = (cabinet_id, advert_id)
+    lock = topup_locks.setdefault(key, asyncio.Lock())
+
+    if lock.locked():
+        await callback.answer("Пополнение этой кампании уже выполняется.", show_alert=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    duplicate_key = (cabinet_id, advert_id, amount)
+    last_success = recent_topups.get(duplicate_key)
+    if last_success is not None and loop.time() - last_success < TOPUP_DUPLICATE_GUARD_SECONDS:
+        pending_topups.pop(token, None)
+        await callback.answer(
+            "Такое пополнение уже выполнялось менее минуты назад.",
+            show_alert=True,
+        )
+        return
+
+    pending_topups.pop(token, None)
+    await callback.answer("Пополняю…")
+
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    async with lock:
+        cabinet = await db_fetchone("SELECT * FROM cabinets WHERE id=?", (cabinet_id,))
+        campaign = await db_fetchone(
+            "SELECT * FROM campaigns WHERE cabinet_id=? AND advert_id=?",
+            (cabinet_id, advert_id),
+        )
+
+        if not cabinet or not campaign:
+            if callback.message:
+                await callback.message.answer("❌ Кампания или кабинет больше не найдены.")
+            return
+
+        try:
+            client = WBClient(decrypt_token(cabinet["token_enc"]))
+            async with aiohttp.ClientSession() as session:
+                result = await client.budget_deposit(session, advert_id, amount)
+
+            recent_topups[duplicate_key] = loop.time()
+            new_total = result.get("total") if isinstance(result, dict) else None
+            amount_text = f"{amount:,}".replace(",", " ")
+
+            total_line = ""
+            if new_total is not None:
+                try:
+                    new_total_text = f"{float(new_total):.0f} ₽"
+                except Exception:
+                    new_total_text = f"{new_total} ₽"
+                total_line = f"\nНовый бюджет кампании: <b>{new_total_text}</b>"
+
+            if callback.message:
+                await callback.message.answer(
+                    "✅ <b>РЕКЛАМА ПОПОЛНЕНА</b>\n"
+                    f"ID кампании: <code>{advert_id}</code>\n"
+                    f"Название: <b>{campaign['name']}</b>\n"
+                    f"Кабинет: <b>{cabinet['seller_name']}</b>\n"
+                    f"Пополнено: <b>{amount_text} ₽</b>\n"
+                    "Источник: <b>Баланс рекламного кабинета</b>"
+                    f"{total_line}"
+                )
+
+            await db_execute(
+                """
+                UPDATE campaigns
+                SET warning_300_sent=0,
+                    last_budget=COALESCE(?, last_budget),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE cabinet_id=? AND advert_id=?
+                """,
+                (new_total, cabinet_id, advert_id),
+            )
+
+        except Exception as exc:
+            logger.exception("Ошибка пополнения кампании %s", advert_id)
+            if callback.message:
+                await callback.message.answer(
+                    "❌ <b>Не удалось пополнить рекламу</b>\n"
+                    f"ID кампании: <code>{advert_id}</code>\n"
+                    f"Кабинет: <b>{cabinet['seller_name']}</b>\n"
+                    f"Ошибка: <code>{str(exc)[:400]}</code>"
+                )
 
 
 @router.callback_query(F.data == "cabinets")
