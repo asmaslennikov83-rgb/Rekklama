@@ -329,10 +329,13 @@ class WBClient:
         )
         if isinstance(data, dict):
             adverts = data.get("adverts")
-            return adverts if isinstance(adverts, list) else []
-        if isinstance(data, list):
-            return data
-        return []
+            rows = adverts if isinstance(adverts, list) else []
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+
+        return [item for item in rows if not is_archived_campaign(item)]
 
     async def campaigns_by_ids(self, session: aiohttp.ClientSession, ids: list[int]) -> list[dict]:
         result: list[dict] = []
@@ -397,6 +400,32 @@ def count_active(count_data: dict) -> tuple[int, int]:
         if int(group.get("status", 0) or 0) == 9:
             active += int(group.get("count", 0) or 0)
     return total, active
+
+
+def is_archived_campaign(item: dict) -> bool:
+    """Дополнительный фильтр архива для WB API V2."""
+    status = item.get("status")
+    try:
+        if status is not None and int(status) in (-1, 7, 8):
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    timestamps = item.get("timestamps") or {}
+    deleted = timestamps.get("deleted")
+    if deleted is None:
+        return False
+
+    deleted_text = str(deleted).strip()
+    if not deleted_text:
+        return False
+
+    # Для действующих кампаний WB использует техническую дату 2100-01-01.
+    if deleted_text.startswith("2100-"):
+        return False
+
+    # Реальная дата удаления/завершения => архив.
+    return True
 
 
 def parse_campaign(item: dict) -> tuple[int, str, int | None]:
@@ -466,6 +495,15 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
         parsed: dict[int, tuple[str, int | None]] = {}
         for item in details:
             try:
+                if is_archived_campaign(item):
+                    logger.info(
+                        "Архивная кампания исключена: id=%s status=%s deleted=%s",
+                        item.get("id"),
+                        item.get("status"),
+                        (item.get("timestamps") or {}).get("deleted"),
+                    )
+                    continue
+
                 advert_id, name, status = parse_campaign(item)
                 if status not in CURRENT_CAMPAIGN_STATUSES:
                     continue
@@ -676,6 +714,8 @@ async def send_status(target: Message | CallbackQuery, bot: Bot):
                 active = 0
                 for item in campaigns:
                     try:
+                        if is_archived_campaign(item):
+                            continue
                         _, _, status = parse_campaign(item)
                     except Exception:
                         continue
