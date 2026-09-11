@@ -728,11 +728,27 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                 row = await db_fetchone("SELECT warning_300_sent FROM campaigns WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
                 warned_300 = bool(row["warning_300_sent"]) if row else False
                 if budget <= 100:
-                    await notify(bot, "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ</b>\n" f"ID кампании: <code>{advert_id}</code>\n" f"Название: <b>{name}</b>\n" f"Кабинет: <b>{cabinet_name}</b>\n" f"Баланс: <b>{budget:.0f} ₽</b>")
+                    await notify(
+                        bot,
+                        "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ</b>\n"
+                        f"ID кампании: <code>{advert_id}</code>\n"
+                        f"Название: <b>{name}</b>\n"
+                        f"Кабинет: <b>{cabinet_name}</b>\n"
+                        f"Баланс: <b>{budget:.0f} ₽</b>",
+                        reply_markup=topup_keyboard(cabinet_id, advert_id),
+                    )
                     await db_execute("UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
                 elif budget <= 300:
                     if not warned_300:
-                        await notify(bot, "🟡 <b>Баланс рекламы ниже 300 ₽</b>\n" f"ID кампании: <code>{advert_id}</code>\n" f"Название: <b>{name}</b>\n" f"Кабинет: <b>{cabinet_name}</b>\n" f"Баланс: <b>{budget:.0f} ₽</b>")
+                        await notify(
+                            bot,
+                            "🟡 <b>Баланс рекламы ниже 300 ₽</b>\n"
+                            f"ID кампании: <code>{advert_id}</code>\n"
+                            f"Название: <b>{name}</b>\n"
+                            f"Кабинет: <b>{cabinet_name}</b>\n"
+                            f"Баланс: <b>{budget:.0f} ₽</b>",
+                            reply_markup=topup_keyboard(cabinet_id, advert_id),
+                        )
                         await db_execute("UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
                 elif warned_300:
                     await db_execute("UPDATE campaigns SET warning_300_sent=0 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
