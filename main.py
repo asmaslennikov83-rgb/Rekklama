@@ -144,6 +144,7 @@ async def init_db() -> None:
                 status INTEGER,
                 last_budget REAL,
                 warning_300_sent INTEGER NOT NULL DEFAULT 0,
+                warning_100_sent INTEGER NOT NULL DEFAULT 0,
                 first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (cabinet_id, advert_id),
@@ -151,6 +152,14 @@ async def init_db() -> None:
             );
             """
         )
+        try:
+            await db.execute(
+                "ALTER TABLE campaigns ADD COLUMN warning_100_sent INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception as exc:
+            if "duplicate column" not in str(exc).lower():
+                logger.warning("Миграция warning_100_sent: %s", exc)
+
         await db.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('check_interval', ?)",
             (str(DEFAULT_CHECK_INTERVAL),),
@@ -728,34 +737,70 @@ async def process_cabinet(bot: Bot, cabinet) -> tuple[int, int]:
                         await notify(bot, f"{title}\nID кампании: <code>{advert_id}</code>\nНазвание: <b>{name}</b>\nКабинет: <b>{cabinet_name}</b>\nБаланс: <b>{budget_text}</b>")
                 await db_execute("""UPDATE campaigns SET name=?, status=?, last_budget=COALESCE(?, last_budget), updated_at=CURRENT_TIMESTAMP WHERE cabinet_id=? AND advert_id=?""", (name, status, budget, cabinet_id, advert_id))
 
+            # Балансовые уведомления: максимум два сообщения за один цикл
+            # расходования — один раз при <=300 ₽ и один раз при <=100 ₽.
             if status == 9 and budget is not None:
-                row = await db_fetchone("SELECT warning_300_sent FROM campaigns WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
+                row = await db_fetchone(
+                    """
+                    SELECT warning_300_sent, warning_100_sent
+                    FROM campaigns
+                    WHERE cabinet_id=? AND advert_id=?
+                    """,
+                    (cabinet_id, advert_id),
+                )
                 warned_300 = bool(row["warning_300_sent"]) if row else False
+                warned_100 = bool(row["warning_100_sent"]) if row else False
+
                 if budget <= 100:
-                    await notify(
-                        bot,
-                        "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ</b>\n"
-                        f"ID кампании: <code>{advert_id}</code>\n"
-                        f"Название: <b>{name}</b>\n"
-                        f"Кабинет: <b>{cabinet_name}</b>\n"
-                        f"Баланс: <b>{budget:.0f} ₽</b>",
-                        reply_markup=topup_keyboard(cabinet_id, advert_id),
-                    )
-                    await db_execute("UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
-                elif budget <= 300:
-                    if not warned_300:
+                    if not warned_100:
                         await notify(
                             bot,
-                            "🟡 <b>Баланс рекламы ниже 300 ₽</b>\n"
+                            "🔴 <b>КРИТИЧЕСКИЙ БАЛАНС РЕКЛАМЫ — 100 ₽</b>\n"
                             f"ID кампании: <code>{advert_id}</code>\n"
                             f"Название: <b>{name}</b>\n"
                             f"Кабинет: <b>{cabinet_name}</b>\n"
                             f"Баланс: <b>{budget:.0f} ₽</b>",
                             reply_markup=topup_keyboard(cabinet_id, advert_id),
                         )
-                        await db_execute("UPDATE campaigns SET warning_300_sent=1 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
-                elif warned_300:
-                    await db_execute("UPDATE campaigns SET warning_300_sent=0 WHERE cabinet_id=? AND advert_id=?", (cabinet_id, advert_id))
+                        await db_execute(
+                            """
+                            UPDATE campaigns
+                            SET warning_300_sent=1, warning_100_sent=1
+                            WHERE cabinet_id=? AND advert_id=?
+                            """,
+                            (cabinet_id, advert_id),
+                        )
+
+                elif budget <= 300:
+                    if not warned_300:
+                        await notify(
+                            bot,
+                            "🟡 <b>БАЛАНС РЕКЛАМЫ — 300 ₽</b>\n"
+                            f"ID кампании: <code>{advert_id}</code>\n"
+                            f"Название: <b>{name}</b>\n"
+                            f"Кабинет: <b>{cabinet_name}</b>\n"
+                            f"Баланс: <b>{budget:.0f} ₽</b>",
+                            reply_markup=topup_keyboard(cabinet_id, advert_id),
+                        )
+                        await db_execute(
+                            """
+                            UPDATE campaigns
+                            SET warning_300_sent=1
+                            WHERE cabinet_id=? AND advert_id=?
+                            """,
+                            (cabinet_id, advert_id),
+                        )
+
+                else:
+                    if warned_300 or warned_100:
+                        await db_execute(
+                            """
+                            UPDATE campaigns
+                            SET warning_300_sent=0, warning_100_sent=0
+                            WHERE cabinet_id=? AND advert_id=?
+                            """,
+                            (cabinet_id, advert_id),
+                        )
 
         if first_sync:
             await db_execute("UPDATE cabinets SET initialized=1 WHERE id=?", (cabinet_id,))
@@ -1250,7 +1295,7 @@ async def cb_topup_confirm(callback: CallbackQuery):
             await db_execute(
                 """
                 UPDATE campaigns
-                SET warning_300_sent=0,
+                SET warning_300_sent=0, warning_100_sent=0,
                     last_budget=COALESCE(?, last_budget),
                     updated_at=CURRENT_TIMESTAMP
                 WHERE cabinet_id=? AND advert_id=?
