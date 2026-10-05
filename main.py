@@ -246,8 +246,8 @@ def topup_keyboard(cabinet_id: int, advert_id: int) -> InlineKeyboardMarkup:
                 callback_data=f"topup_ask:{cabinet_id}:{advert_id}:3000",
             ),
             InlineKeyboardButton(
-                text="➕ 5 000 ₽",
-                callback_data=f"topup_ask:{cabinet_id}:{advert_id}:5000",
+                text="➕ 10 000 ₽",
+                callback_data=f"topup_ask:{cabinet_id}:{advert_id}:10000",
             ),
         ]]
     )
@@ -1146,7 +1146,7 @@ async def cb_topup_ask(callback: CallbackQuery):
         await callback.answer("Некорректные параметры пополнения.", show_alert=True)
         return
 
-    if amount not in (1000, 3000, 5000):
+    if amount not in (1000, 3000, 10000):
         await callback.answer("Недопустимая сумма.", show_alert=True)
         return
 
