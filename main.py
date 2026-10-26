@@ -37,6 +37,7 @@ DEFAULT_CHECK_INTERVAL = int(os.getenv("DEFAULT_CHECK_INTERVAL", "15"))
 ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
 EXCLUDED_CAMPAIGN_IDS_RAW = os.getenv("EXCLUDED_CAMPAIGN_IDS", "23200814").strip()
 MAX_CABINETS = 2
+APP_VERSION = "2026.10.26-r1"
 
 WB_ADVERT_BASE = "https://advert-api.wildberries.ru"
 WB_COMMON_BASE = "https://common-api.wildberries.ru"
@@ -942,8 +943,11 @@ async def run_spend_comparison(bot: Bot, manual: bool = False) -> None:
                     y_key,
                 )
 
-            spends = {
-                advert_id: {d_key: 0.0, y_key: 0.0}
+            metrics = {
+                advert_id: {
+                    d_key: {"spend": 0.0, "orders": 0},
+                    y_key: {"spend": 0.0, "orders": 0},
+                }
                 for advert_id in campaigns
             }
 
@@ -958,26 +962,62 @@ async def run_spend_comparison(bot: Bot, manual: bool = False) -> None:
 
                 for day in row.get("days", []) or []:
                     date_key = str(day.get("date") or "")[:10]
-                    if date_key in (d_key, y_key):
+                    if date_key not in (d_key, y_key):
+                        continue
+
+                    try:
+                        metrics[advert_id][date_key]["spend"] += float(day.get("sum", 0) or 0)
+                    except Exception:
+                        pass
+
+                    # Заказы считаем без двойного учёта: сначала day.orders,
+                    # затем app.orders, а если их нет — суммируем nm.orders.
+                    orders_value = day.get("orders")
+                    if orders_value is not None:
                         try:
-                            spends[advert_id][date_key] += float(day.get("sum", 0) or 0)
+                            metrics[advert_id][date_key]["orders"] += int(orders_value or 0)
                         except Exception:
                             pass
+                    else:
+                        apps = day.get("apps", []) or []
+                        app_orders_present = any(app.get("orders") is not None for app in apps)
+
+                        if app_orders_present:
+                            for app in apps:
+                                try:
+                                    metrics[advert_id][date_key]["orders"] += int(app.get("orders", 0) or 0)
+                                except Exception:
+                                    pass
+                        else:
+                            for app in apps:
+                                for nm in app.get("nms", []) or []:
+                                    try:
+                                        metrics[advert_id][date_key]["orders"] += int(nm.get("orders", 0) or 0)
+                                    except Exception:
+                                        pass
 
             alerts = []
             for advert_id, name in campaigns.items():
-                before = spends[advert_id][d_key]
-                yes = spends[advert_id][y_key]
+                before = metrics[advert_id][d_key]["spend"]
+                yes = metrics[advert_id][y_key]["spend"]
+                before_orders = metrics[advert_id][d_key]["orders"]
+                yesterday_orders = metrics[advert_id][y_key]["orders"]
                 diff = yes - before
 
                 if before <= 0:
                     if yes > 0:
-                        alerts.append((advert_id, name, before, yes, diff, None))
+                        alerts.append((
+                            advert_id, name, before, yes, diff, None,
+                            before_orders, yesterday_orders,
+                        ))
                     continue
 
                 growth = diff / before * 100
                 if growth >= threshold:
-                    alerts.append((advert_id, name, before, yes, diff, growth))
+                    alerts.append((
+                        advert_id, name, before, yes, diff, growth,
+                        before_orders, yesterday_orders,
+                    ))
 
             if not alerts:
                 continue
@@ -990,17 +1030,24 @@ async def run_spend_comparison(bot: Bot, manual: bool = False) -> None:
                 f"Сравнение: {day_before.strftime('%d.%m.%Y')} → {yesterday.strftime('%d.%m.%Y')}",
             ]
 
-            for advert_id, name, before, yes, diff, growth in alerts:
+            for (
+                advert_id, name, before, yes, diff, growth,
+                before_orders, yesterday_orders,
+            ) in alerts:
+                order_diff = yesterday_orders - before_orders
+                order_diff_text = f"+{order_diff}" if order_diff >= 0 else str(order_diff)
+
                 lines.extend([
                     "",
                     f"ID кампании: <code>{advert_id}</code>",
                     f"Название: <b>{name}</b>",
-                    f"Позавчера: <b>{_money(before)} ₽</b>",
-                    f"Вчера: <b>{_money(yes)} ₽</b>",
-                    f"Разница: <b>+{_money(diff)} ₽</b>",
-                    "Изменение: <b>Новые расходы</b>"
+                    f"Позавчера: <b>{_money(before)} ₽</b> / <b>{before_orders} заказов</b>",
+                    f"Вчера: <b>{_money(yes)} ₽</b> / <b>{yesterday_orders} заказов</b>",
+                    f"Разница затрат: <b>+{_money(diff)} ₽</b>",
+                    f"Разница заказов: <b>{order_diff_text}</b>",
+                    "Изменение затрат: <b>Новые расходы</b>"
                     if growth is None
-                    else f"Рост: <b>+{growth:.1f}%</b>",
+                    else f"Рост затрат: <b>+{growth:.1f}%</b>",
                 ])
 
             await notify(bot, "\n".join(lines))
@@ -1101,7 +1148,8 @@ async def cmd_start(message: Message):
         return
     await message.answer(
         "📣 <b>WB Ads Monitor</b>\n"
-        "Контроль рекламных кампаний Wildberries.",
+        "Контроль рекламных кампаний Wildberries.\n"
+        f"Версия: <code>{APP_VERSION}</code>",
         reply_markup=menu_keyboard(),
     )
 
@@ -1166,7 +1214,9 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     if callback.message:
         await callback.message.edit_text(
-            "📣 <b>WB Ads Monitor</b>\nВыберите действие:",
+            "📣 <b>WB Ads Monitor</b>\n"
+            f"Версия: <code>{APP_VERSION}</code>\n\n"
+            "Выберите действие:",
             reply_markup=menu_keyboard(),
         )
 
