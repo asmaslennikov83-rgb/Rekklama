@@ -4,7 +4,8 @@ import hashlib
 import logging
 import uuid
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any
 
 import aiohttp
@@ -79,6 +80,10 @@ class AddCabinet(StatesGroup):
 
 class SetInterval(StatesGroup):
     waiting_minutes = State()
+
+
+class SetSpendThreshold(StatesGroup):
+    waiting_percent = State()
 
 
 def make_fernet(secret: str) -> Fernet:
@@ -163,6 +168,12 @@ async def init_db() -> None:
         await db.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('check_interval', ?)",
             (str(DEFAULT_CHECK_INTERVAL),),
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('spend_growth_threshold', '20')"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('last_spend_check_date', '')"
         )
         await db.commit()
 
@@ -283,6 +294,9 @@ def menu_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="⏱ Интервал проверки", callback_data="interval"),
                 InlineKeyboardButton(text="📋 Последние события", callback_data="events"),
+            ],
+            [
+                InlineKeyboardButton(text="📈 Контроль расходов", callback_data="spend_control"),
             ],
         ]
     )
@@ -510,6 +524,35 @@ class WBClient:
             },
         )
         return data if isinstance(data, dict) else {}
+
+    async def fullstats(
+        self,
+        session: aiohttp.ClientSession,
+        ids: list[int],
+        begin_date: str,
+        end_date: str,
+    ) -> list[dict]:
+        result = []
+        for pos in range(0, len(ids), 50):
+            chunk = ids[pos:pos + 50]
+            data = await self._get(
+                session,
+                f"{WB_ADVERT_BASE}/adv/v3/fullstats",
+                params={
+                    "ids": ",".join(map(str, chunk)),
+                    "beginDate": begin_date,
+                    "endDate": end_date,
+                },
+            )
+            if isinstance(data, list):
+                result.extend(data)
+            elif isinstance(data, dict):
+                rows = data.get("adverts") or data.get("data") or data.get("items") or []
+                if isinstance(rows, list):
+                    result.extend(rows)
+            if pos + 50 < len(ids):
+                await asyncio.sleep(21)
+        return result
 
     async def budget(self, session: aiohttp.ClientSession, advert_id: int) -> float:
         data = await self._get(
@@ -852,6 +895,147 @@ async def check_all(
                     )
 
         return results
+
+
+
+def _money(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ")
+
+
+async def run_spend_comparison(bot: Bot, manual: bool = False) -> None:
+    threshold = float(await get_setting("spend_growth_threshold", "20") or 20)
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    yesterday = now_msk.date() - timedelta(days=1)
+    day_before = now_msk.date() - timedelta(days=2)
+    y_key, d_key = yesterday.isoformat(), day_before.isoformat()
+
+    cabinets = await db_fetchall("SELECT * FROM cabinets ORDER BY id")
+    any_alerts = False
+
+    for idx, cabinet in enumerate(cabinets):
+        if idx > 0:
+            await asyncio.sleep(5)
+
+        try:
+            client = WBClient(decrypt_token(cabinet["token_enc"]))
+            async with aiohttp.ClientSession() as session:
+                current = await client.current_campaigns(session)
+                campaigns = {}
+                for item in current:
+                    try:
+                        advert_id, name, status = parse_campaign(item)
+                    except Exception:
+                        continue
+                    if (
+                        status in CURRENT_CAMPAIGN_STATUSES
+                        and not is_excluded_campaign_id(advert_id)
+                    ):
+                        campaigns[advert_id] = name
+
+                if not campaigns:
+                    continue
+
+                stats = await client.fullstats(
+                    session,
+                    sorted(campaigns),
+                    d_key,
+                    y_key,
+                )
+
+            spends = {
+                advert_id: {d_key: 0.0, y_key: 0.0}
+                for advert_id in campaigns
+            }
+
+            for row in stats:
+                advert_id = row.get("advertId") or row.get("id")
+                try:
+                    advert_id = int(advert_id)
+                except Exception:
+                    continue
+                if advert_id not in campaigns:
+                    continue
+
+                for day in row.get("days", []) or []:
+                    date_key = str(day.get("date") or "")[:10]
+                    if date_key in (d_key, y_key):
+                        try:
+                            spends[advert_id][date_key] += float(day.get("sum", 0) or 0)
+                        except Exception:
+                            pass
+
+            alerts = []
+            for advert_id, name in campaigns.items():
+                before = spends[advert_id][d_key]
+                yes = spends[advert_id][y_key]
+                diff = yes - before
+
+                if before <= 0:
+                    if yes > 0:
+                        alerts.append((advert_id, name, before, yes, diff, None))
+                    continue
+
+                growth = diff / before * 100
+                if growth >= threshold:
+                    alerts.append((advert_id, name, before, yes, diff, growth))
+
+            if not alerts:
+                continue
+
+            any_alerts = True
+            lines = [
+                "📈 <b>РОСТ РАСХОДОВ НА РЕКЛАМУ</b>",
+                f"Кабинет: <b>{cabinet['seller_name']}</b>",
+                f"Порог: <b>{threshold:g}%</b>",
+                f"Сравнение: {day_before.strftime('%d.%m.%Y')} → {yesterday.strftime('%d.%m.%Y')}",
+            ]
+
+            for advert_id, name, before, yes, diff, growth in alerts:
+                lines.extend([
+                    "",
+                    f"ID кампании: <code>{advert_id}</code>",
+                    f"Название: <b>{name}</b>",
+                    f"Позавчера: <b>{_money(before)} ₽</b>",
+                    f"Вчера: <b>{_money(yes)} ₽</b>",
+                    f"Разница: <b>+{_money(diff)} ₽</b>",
+                    "Изменение: <b>Новые расходы</b>"
+                    if growth is None
+                    else f"Рост: <b>+{growth:.1f}%</b>",
+                ])
+
+            await notify(bot, "\n".join(lines))
+
+        except Exception as exc:
+            logger.exception("Ошибка анализа расходов: %s", cabinet["seller_name"])
+            await notify(
+                bot,
+                "⚠️ <b>Ошибка анализа расходов рекламы</b>\n"
+                f"Кабинет: <b>{cabinet['seller_name']}</b>\n"
+                f"Ошибка: <code>{str(exc)[:400]}</code>",
+            )
+
+    if manual and not any_alerts:
+        await notify(
+            bot,
+            "✅ <b>Рост расходов не обнаружен</b>\n"
+            f"Порог: <b>{threshold:g}%</b>\n"
+            f"Сравнение: {day_before.strftime('%d.%m.%Y')} → {yesterday.strftime('%d.%m.%Y')}",
+        )
+
+
+async def spend_schedule_loop(bot: Bot) -> None:
+    await asyncio.sleep(10)
+    while True:
+        try:
+            now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+            today_key = now_msk.date().isoformat()
+            last_run = await get_setting("last_spend_check_date", "")
+            if (now_msk.hour, now_msk.minute) >= (11, 20) and last_run != today_key:
+                await run_spend_comparison(bot, manual=False)
+                await set_setting("last_spend_check_date", today_key)
+        except Exception:
+            logger.exception("Ошибка планировщика анализа расходов")
+        await asyncio.sleep(60)
 
 
 async def polling_loop(bot: Bot) -> None:
@@ -1424,6 +1608,74 @@ async def receive_interval(message: Message, state: FSMContext):
     )
 
 
+
+@router.callback_query(F.data == "spend_control")
+async def cb_spend_control(callback: CallbackQuery):
+    if not await guard_callback(callback):
+        return
+    threshold = await get_setting("spend_growth_threshold", "20")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✏️ Изменить %", callback_data="spend_threshold_set"),
+                InlineKeyboardButton(text="🔄 Проверить сейчас", callback_data="spend_check_now"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
+        ]
+    )
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "📈 <b>Контроль расходов рекламы</b>\n\n"
+            f"Порог роста: <b>{threshold}%</b>\n"
+            "Сравнение: вчера против позавчера\n"
+            "Автопроверка: <b>каждый день в 11:20 МСК</b>",
+            reply_markup=kb,
+        )
+
+
+@router.callback_query(F.data == "spend_threshold_set")
+async def cb_spend_threshold_set(callback: CallbackQuery, state: FSMContext):
+    if not await guard_callback(callback):
+        return
+    await state.set_state(SetSpendThreshold.waiting_percent)
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "Введите порог роста расходов в процентах.\nНапример: <code>20</code>",
+            reply_markup=back_keyboard(),
+        )
+
+
+@router.message(SetSpendThreshold.waiting_percent)
+async def receive_spend_threshold(message: Message, state: FSMContext):
+    if not await guard_message(message):
+        return
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        value = float(raw)
+        if not 1 <= value <= 1000:
+            raise ValueError
+    except ValueError:
+        await message.answer("Введите число от 1 до 1000.")
+        return
+    value_text = f"{value:g}"
+    await set_setting("spend_growth_threshold", value_text)
+    await state.clear()
+    await message.answer(
+        f"✅ Порог установлен: <b>{value_text}%</b>",
+        reply_markup=menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "spend_check_now")
+async def cb_spend_check_now(callback: CallbackQuery, bot: Bot):
+    if not await guard_callback(callback):
+        return
+    await callback.answer("Сравниваю расходы…")
+    await run_spend_comparison(bot, manual=True)
+
+
 @router.callback_query(F.data == "events")
 async def cb_events(callback: CallbackQuery):
     if not await guard_callback(callback):
@@ -1474,14 +1726,17 @@ async def main():
 
     await setup_commands(bot)
     background = asyncio.create_task(polling_loop(bot))
+    spend_background = asyncio.create_task(spend_schedule_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
         background.cancel()
-        try:
-            await background
-        except asyncio.CancelledError:
-            pass
+        spend_background.cancel()
+        for task in (background, spend_background):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
 
 
